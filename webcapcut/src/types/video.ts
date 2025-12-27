@@ -41,6 +41,18 @@ export interface ExportPreset {
 
 export const EXPORT_PRESETS: ExportPreset[] = [
     {
+        name: '480p-fast',
+        label: '480p Fast (854x480) ⚡',
+        options: {
+            width: 854,
+            height: 480,
+            frameRate: 24, // Lower framerate for faster export
+            videoBitrate: 2_000_000,
+            audioBitrate: 96_000,
+            audioSampleRate: 44100
+        }
+    },
+    {
         name: '720p',
         label: '720p HD (1280x720)',
         options: {

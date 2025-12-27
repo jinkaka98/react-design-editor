@@ -1,5 +1,6 @@
 import { WebGPUContext } from './WebGPUContext';
 import { calculateVideoTransform } from '../utils/videoTransform';
+import { perfMonitor } from '../utils/PerformanceMonitor';
 
 export class CanvasRenderer {
     private pipeline: GPURenderPipeline | null = null;
@@ -126,6 +127,7 @@ export class CanvasRenderer {
 
         const render = () => {
             this.animationId = requestAnimationFrame(render);
+            const frameStart = performance.now();
 
             if (!playbackStore) {
                 return;
@@ -155,7 +157,15 @@ export class CanvasRenderer {
             }
 
             // Get source for current time
+            const sourceStart = performance.now();
             const source = getSource(state.currentTime);
+            const sourceFetchTime = performance.now() - sourceStart;
+
+            if (sourceFetchTime > 5) {
+                perfMonitor.recordMetric('CanvasRenderer', 'getSource', sourceFetchTime, {
+                    time: state.currentTime / 1_000_000
+                });
+            }
 
             // Sync video element
             if (source && source instanceof HTMLVideoElement) {
@@ -174,14 +184,31 @@ export class CanvasRenderer {
             // Render
             if (source) {
                 try {
+                    const renderStart = performance.now();
                     this.renderSource(gpu, source);
+                    const renderTime = performance.now() - renderStart;
+
+                    if (renderTime > 10) {
+                        perfMonitor.recordMetric('CanvasRenderer', 'renderSource', renderTime);
+                    }
                 } catch (e) {
                     if (this.frameCount < 10) {
-                        console.error('[Renderer] Render error:', e);
+                        perfMonitor.error('CanvasRenderer', 'Render error', e);
                     }
                 }
             } else {
                 this.clearCanvas(gpu);
+            }
+
+            // Frame timing
+            const frameTime = performance.now() - frameStart;
+            perfMonitor.recordFrame();
+
+            if (frameTime > 16.67) { // Below 60fps
+                perfMonitor.recordMetric('CanvasRenderer', 'slowFrame', frameTime, {
+                    isPlaying,
+                    hasSource: !!source
+                });
             }
 
             // FPS counter (log every 5 seconds to reduce overhead)
@@ -191,7 +218,9 @@ export class CanvasRenderer {
                 this.fps = Math.round(this.frameCount / 5);
                 this.frameCount = 0;
                 this.lastFpsUpdate = now;
-                console.log('[Renderer] FPS:', this.fps);
+
+                const fpsStats = perfMonitor.getFpsStats();
+                console.log(`[Renderer] FPS: ${this.fps} | Avg: ${fpsStats.avg.toFixed(1)} | Dropped: ${fpsStats.dropped}`);
             }
         };
 

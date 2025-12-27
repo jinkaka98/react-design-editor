@@ -8,6 +8,7 @@ import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { PlaybackControls } from './controls/PlaybackControls';
 import videoShaderCode from '../core/shaders/video.wgsl?raw';
 import { audioSystem } from '../core/AudioSystem';
+import { perfMonitor } from '../utils/PerformanceMonitor';
 
 export function VideoPlayer() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -84,7 +85,19 @@ export function VideoPlayer() {
         let lastAudioUpdate = 0;
 
         const unsubscribe = usePlaybackStore.subscribe((state) => {
+            const syncStart = performance.now();
+
+            // Track clip fetching time
+            const clipFetchStart = performance.now();
             const activeClips = getActiveClips(state.currentTime);
+            const clipFetchTime = performance.now() - clipFetchStart;
+
+            if (clipFetchTime > 2) {
+                perfMonitor.recordMetric('VideoPlayer', 'getActiveClips', clipFetchTime, {
+                    clipCount: activeClips.length,
+                    time: state.currentTime / 1_000_000
+                });
+            }
 
             // Get first video clip's video element (for preview rendering)
             const firstVideoClip = activeClips.find(c => c.track.type === 'video');
@@ -97,16 +110,25 @@ export function VideoPlayer() {
                 const clipLocalTime = (state.currentTime - firstVideoClip.segment.start + firstVideoClip.clip.srcStart) / 1_000_000;
 
                 // Sync video time (increased threshold from 0.1 to 0.3)
-                if (Math.abs(video.currentTime - clipLocalTime) > 0.3) {
+                const timeDiff = Math.abs(video.currentTime - clipLocalTime);
+                if (timeDiff > 0.3) {
+                    const seekStart = performance.now();
                     video.currentTime = Math.max(0, Math.min(clipLocalTime, video.duration || Infinity));
+                    perfMonitor.recordMetric('VideoPlayer', 'videoSeek', performance.now() - seekStart, {
+                        from: video.currentTime,
+                        to: clipLocalTime,
+                        diff: timeDiff
+                    });
                 }
 
                 // Sync play state
                 if (state.isPlaying && video.paused) {
                     video.playbackRate = state.playbackRate;
                     video.play().catch(() => { });
+                    perfMonitor.log('VideoPlayer', 'play started', { rate: state.playbackRate });
                 } else if (!state.isPlaying && !video.paused) {
                     video.pause();
+                    perfMonitor.log('VideoPlayer', 'paused');
                 }
 
                 // Sync playback rate
@@ -126,6 +148,7 @@ export function VideoPlayer() {
             if (state.isPlaying && now - lastAudioUpdate > 100) {
                 lastAudioUpdate = now;
 
+                const audioStart = performance.now();
                 const audioClipData = activeClips
                     .filter(c => audioSystem.hasAudioForAsset(c.asset.id))
                     .map(c => ({
@@ -137,8 +160,24 @@ export function VideoPlayer() {
                     audioSystem.play();
                 }
                 audioSystem.updateActiveClips(audioClipData);
+
+                const audioUpdateTime = performance.now() - audioStart;
+                if (audioUpdateTime > 5) {
+                    perfMonitor.recordMetric('VideoPlayer', 'audioUpdate', audioUpdateTime, {
+                        clipCount: audioClipData.length
+                    });
+                }
             } else if (!state.isPlaying && audioSystem.isPlaying()) {
                 audioSystem.stop();
+            }
+
+            // Track total sync time
+            const totalSyncTime = performance.now() - syncStart;
+            if (totalSyncTime > 10) {
+                perfMonitor.recordMetric('VideoPlayer', 'syncLoop', totalSyncTime, {
+                    isPlaying: state.isPlaying,
+                    clips: activeClips.length
+                });
             }
         });
         return unsubscribe;

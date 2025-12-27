@@ -7,6 +7,7 @@
 import { ExportOptions } from '../types/video';
 import { useTimelineStore } from '../store/timelineStore';
 import { audioSystem } from './AudioSystem';
+import { perfMonitor } from '../utils/PerformanceMonitor';
 
 export interface ExportProgress {
     percent: number;
@@ -104,80 +105,99 @@ export class ExportManager {
                     }
                 });
 
-                // Create worker
-                const workerStartTime = performance.now();
-                this.worker = new Worker(
-                    new URL('../workers/encoding.worker.ts', import.meta.url),
-                    { type: 'module' }
-                );
-
-                // Handle worker messages
-                this.worker.onmessage = async (e) => {
-                    const data = e.data;
-
-                    if (data.type === 'ready') {
-                        this.stats!.workerInitTime = performance.now() - workerStartTime;
-                        console.log(`[Export] ✓ Worker ready in ${this.stats!.workerInitTime.toFixed(0)}ms`);
-
-                        // Start sending frames
-                        const renderStart = performance.now();
-                        await this.renderAndSendFrames(options, totalFrames, durationSec, timelineState);
-                        this.stats!.videoRenderTime = performance.now() - renderStart;
-
-                    } else if (data.type === 'progress') {
-                        this.reportProgress({
-                            percent: data.percent,
-                            currentFrame: data.currentFrame,
-                            totalFrames: data.totalFrames,
-                            stage: 'encoding'
-                        });
-
-                        // Log every 30 frames
-                        if (data.currentFrame % 30 === 0) {
-                            console.log(`[Export] Frame ${data.currentFrame}/${data.totalFrames} (${data.percent}%)`);
-                        }
-
-                    } else if (data.type === 'complete') {
-                        const blob = new Blob([data.buffer], { type: 'video/mp4' });
-
-                        // Print performance report
-                        this.printPerformanceReport(blob, totalFrames);
-
-                        this.reportProgress({ percent: 100, currentFrame: totalFrames, totalFrames, stage: 'complete' });
-                        this.cleanup();
-                        resolve(blob);
-
-                    } else if (data.type === 'error') {
-                        console.error('[Export] ❌ Worker error:', data.error);
-                        this.reportProgress({ percent: 0, currentFrame: 0, totalFrames, stage: 'error', error: data.error });
-                        this.cleanup();
-                        reject(new Error(data.error));
-                    }
-                };
-
-                this.worker.onerror = (e) => {
-                    console.error('[Export] ❌ Worker crashed:', e);
-                    this.cleanup();
-                    reject(new Error('Worker crashed: ' + e.message));
-                };
-
-                // Initialize worker
-                this.worker.postMessage({
-                    type: 'init',
-                    width: options.width,
-                    height: options.height,
-                    frameRate: options.frameRate,
-                    videoBitrate: options.videoBitrate,
-                    totalFrames,
-                    audioSampleRate: options.audioSampleRate,
-                    audioBitrate: options.audioBitrate
-                });
+                // CRITICAL: Preload all videos before export
+                console.log('[Export] Preloading videos...');
+                this.preloadVideos(timelineState).then(() => {
+                    console.log('[Export] ✓ Videos preloaded');
+                    this.startExportWorker(options, totalFrames, durationSec, timelineState, resolve, reject);
+                }).catch(reject);
 
             } catch (error) {
                 console.error('[Export] ❌ Export failed:', error);
                 this.cleanup();
                 reject(error);
             }
+        });
+    }
+
+    /**
+     * Start the export worker after preload is complete
+     */
+    private startExportWorker(
+        options: ExportOptions,
+        totalFrames: number,
+        durationSec: number,
+        timelineState: ReturnType<typeof useTimelineStore.getState>,
+        resolve: (blob: Blob) => void,
+        reject: (error: Error) => void
+    ): void {
+        // Create worker
+        const workerStartTime = performance.now();
+        this.worker = new Worker(
+            new URL('../workers/encoding.worker.ts', import.meta.url),
+            { type: 'module' }
+        );
+
+        // Handle worker messages
+        this.worker.onmessage = async (e) => {
+            const data = e.data;
+
+            if (data.type === 'ready') {
+                this.stats!.workerInitTime = performance.now() - workerStartTime;
+                console.log(`[Export] ✓ Worker ready in ${this.stats!.workerInitTime.toFixed(0)}ms`);
+
+                // Start sending frames
+                const renderStart = performance.now();
+                await this.renderAndSendFrames(options, totalFrames, durationSec, timelineState);
+                this.stats!.videoRenderTime = performance.now() - renderStart;
+
+            } else if (data.type === 'progress') {
+                this.reportProgress({
+                    percent: data.percent,
+                    currentFrame: data.currentFrame,
+                    totalFrames: data.totalFrames,
+                    stage: 'encoding'
+                });
+
+                // Log every 30 frames
+                if (data.currentFrame % 30 === 0) {
+                    console.log(`[Export] Frame ${data.currentFrame}/${data.totalFrames} (${data.percent}%)`);
+                }
+
+            } else if (data.type === 'complete') {
+                const blob = new Blob([data.buffer], { type: 'video/mp4' });
+
+                // Print performance report
+                this.printPerformanceReport(blob, totalFrames);
+
+                this.reportProgress({ percent: 100, currentFrame: totalFrames, totalFrames, stage: 'complete' });
+                this.cleanup();
+                resolve(blob);
+
+            } else if (data.type === 'error') {
+                console.error('[Export] ❌ Worker error:', data.error);
+                this.reportProgress({ percent: 0, currentFrame: 0, totalFrames, stage: 'error', error: data.error });
+                this.cleanup();
+                reject(new Error(data.error));
+            }
+        };
+
+        this.worker.onerror = (e) => {
+            console.error('[Export] ❌ Worker crashed:', e);
+            this.cleanup();
+            reject(new Error('Worker crashed: ' + e.message));
+        };
+
+        // Initialize worker
+        this.worker.postMessage({
+            type: 'init',
+            width: options.width,
+            height: options.height,
+            frameRate: options.frameRate,
+            videoBitrate: options.videoBitrate,
+            totalFrames,
+            audioSampleRate: options.audioSampleRate,
+            audioBitrate: options.audioBitrate
         });
     }
 
@@ -200,6 +220,7 @@ export class ExportManager {
 
         let frameNum = 0;
         let lastLogTime = performance.now();
+        let lastVideoTime = -1; // Track last video time for sequential optimization
 
         const renderNextFrame = async () => {
             if (this.cancelled || !this.worker) {
@@ -244,10 +265,27 @@ export class ExportManager {
                     console.warn(`[Export] ⚠️ Frame ${frameNum}: Video not ready (state=${video.readyState})`);
                 }
 
-                // Seek video
+                // Optimized seek strategy:
+                // - If forward seek <0.5s, use current frame (video decoder predicts well)
+                // - If backward seek or large jump, use random seek
                 const seekStart = performance.now();
-                video.currentTime = Math.max(0, Math.min(localTime, video.duration));
-                await this.waitForVideoSeek(video);
+                const timeDiff = localTime - lastVideoTime;
+
+                if (lastVideoTime >= 0 && timeDiff >= 0 && timeDiff < 0.5) {
+                    // Sequential forward - just wait for video to advance naturally
+                    // Video is already playing forward, minor sync adjustment
+                    if (Math.abs(video.currentTime - localTime) > 0.1) {
+                        video.currentTime = localTime;
+                        await this.waitForVideoSeekFast(video);
+                    }
+                    // else: use current frame as-is (fastest)
+                } else {
+                    // Random access needed (backwards or large jump)
+                    video.currentTime = Math.max(0, Math.min(localTime, video.duration));
+                    await this.waitForVideoSeek(video);
+                }
+
+                lastVideoTime = localTime;
                 seekTime = performance.now() - seekStart;
                 this.stats!.frameSeekTimes.push(seekTime);
 
@@ -284,6 +322,10 @@ export class ExportManager {
                 if (this.stats!.slowFrames <= 5) {
                     console.warn(`[Export] ⚠️ Slow frame ${frameNum}: ${frameTime.toFixed(0)}ms (seek: ${seekTime.toFixed(0)}ms)`);
                 }
+                perfMonitor.recordMetric('Export', 'slowFrame', frameTime, {
+                    frame: frameNum,
+                    seekTime
+                });
             }
 
             // Log every 60 frames or every 2 seconds
@@ -479,6 +521,85 @@ export class ExportManager {
             };
             video.addEventListener('seeked', onSeeked);
             setTimeout(resolve, 50);
+        });
+    }
+
+    // Fast version for sequential forward seeks - minimal wait
+    private waitForVideoSeekFast(video: HTMLVideoElement): Promise<void> {
+        return new Promise((resolve) => {
+            if (video.readyState >= 2) {
+                resolve();
+                return;
+            }
+
+            const onSeeked = () => {
+                video.removeEventListener('seeked', onSeeked);
+                resolve();
+            };
+            video.addEventListener('seeked', onSeeked);
+            setTimeout(resolve, 10); // Much shorter timeout for fast sequential seeks
+        });
+    }
+
+    /**
+     * Preload all videos to ensure they're fully buffered before export
+     */
+    private async preloadVideos(
+        timelineState: ReturnType<typeof useTimelineStore.getState>
+    ): Promise<void> {
+        const videos: HTMLVideoElement[] = [];
+
+        timelineState.assets.forEach((asset) => {
+            if (asset.videoElement) {
+                videos.push(asset.videoElement);
+            }
+        });
+
+        console.log(`[Export] Preloading ${videos.length} video(s)...`);
+
+        await Promise.all(videos.map(video => this.ensureVideoLoaded(video)));
+    }
+
+    /**
+     * Ensure a single video is fully loaded and ready for random access
+     */
+    private ensureVideoLoaded(video: HTMLVideoElement): Promise<void> {
+        return new Promise((resolve) => {
+            // If already have enough data, resolve immediately
+            if (video.readyState >= 4) { // HAVE_ENOUGH_DATA
+                console.log(`[Export] Video already loaded: ${video.videoWidth}x${video.videoHeight}`);
+                resolve();
+                return;
+            }
+
+            // Force loading by playing briefly then pausing
+            const wasPlaying = !video.paused;
+            video.muted = true; // Prevent audio during preload
+
+            const onCanPlay = () => {
+                video.removeEventListener('canplaythrough', onCanPlay);
+                video.pause();
+                video.muted = false;
+                console.log(`[Export] Video ready: ${video.videoWidth}x${video.videoHeight}, state=${video.readyState}`);
+                resolve();
+            };
+
+            video.addEventListener('canplaythrough', onCanPlay);
+
+            // Try to trigger loading
+            video.currentTime = 0;
+            video.play().catch(() => {
+                // If autoplay is blocked, try just loading
+                video.load();
+            });
+
+            // Timeout fallback
+            setTimeout(() => {
+                video.removeEventListener('canplaythrough', onCanPlay);
+                if (!wasPlaying) video.pause();
+                console.warn(`[Export] Video preload timeout, state=${video.readyState}`);
+                resolve();
+            }, 5000);
         });
     }
 
