@@ -72,7 +72,8 @@ export class AudioSystem {
                 const elapsed = this.audioContext.currentTime - sourceInfo.startedAt;
                 const expectedTime = sourceInfo.offset + elapsed;
 
-                if (Math.abs(expectedTime - clip.localTime) > 0.15) {
+                // Only resync if >0.5s out of sync (was 0.15s - too aggressive)
+                if (Math.abs(expectedTime - clip.localTime) > 0.5) {
                     // Re-sync needed
                     this.stopSource(clip.assetId);
                     this.startSource(clip.assetId, clip.localTime);

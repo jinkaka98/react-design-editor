@@ -184,11 +184,11 @@ export class CanvasRenderer {
                 this.clearCanvas(gpu);
             }
 
-            // FPS counter
+            // FPS counter (log every 5 seconds to reduce overhead)
             this.frameCount++;
             const now = performance.now();
-            if (now - this.lastFpsUpdate >= 1000) {
-                this.fps = this.frameCount;
+            if (now - this.lastFpsUpdate >= 5000) {
+                this.fps = Math.round(this.frameCount / 5);
                 this.frameCount = 0;
                 this.lastFpsUpdate = now;
                 console.log('[Renderer] FPS:', this.fps);

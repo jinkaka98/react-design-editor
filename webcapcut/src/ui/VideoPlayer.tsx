@@ -81,6 +81,8 @@ export function VideoPlayer() {
 
     // Sync playback with timeline clips
     useEffect(() => {
+        let lastAudioUpdate = 0;
+
         const unsubscribe = usePlaybackStore.subscribe((state) => {
             const activeClips = getActiveClips(state.currentTime);
 
@@ -94,8 +96,8 @@ export function VideoPlayer() {
                 // Calculate time within clip (local time in source video)
                 const clipLocalTime = (state.currentTime - firstVideoClip.segment.start + firstVideoClip.clip.srcStart) / 1_000_000;
 
-                // Sync video time
-                if (Math.abs(video.currentTime - clipLocalTime) > 0.1) {
+                // Sync video time (increased threshold from 0.1 to 0.3)
+                if (Math.abs(video.currentTime - clipLocalTime) > 0.3) {
                     video.currentTime = Math.max(0, Math.min(clipLocalTime, video.duration || Infinity));
                 }
 
@@ -119,24 +121,24 @@ export function VideoPlayer() {
                 activeVideoRef.current = null;
             }
 
-            // Multi-track audio: collect ALL active clips with audio
-            const audioClipData = activeClips
-                .filter(c => audioSystem.hasAudioForAsset(c.asset.id))
-                .map(c => ({
-                    assetId: c.asset.id,
-                    localTime: (state.currentTime - c.segment.start + c.clip.srcStart) / 1_000_000
-                }));
+            // Multi-track audio: throttle updates to every 100ms
+            const now = performance.now();
+            if (state.isPlaying && now - lastAudioUpdate > 100) {
+                lastAudioUpdate = now;
 
-            if (state.isPlaying) {
+                const audioClipData = activeClips
+                    .filter(c => audioSystem.hasAudioForAsset(c.asset.id))
+                    .map(c => ({
+                        assetId: c.asset.id,
+                        localTime: (state.currentTime - c.segment.start + c.clip.srcStart) / 1_000_000
+                    }));
+
                 if (!audioSystem.isPlaying()) {
                     audioSystem.play();
                 }
-                // Update all active audio sources
                 audioSystem.updateActiveClips(audioClipData);
-            } else {
-                if (audioSystem.isPlaying()) {
-                    audioSystem.stop();
-                }
+            } else if (!state.isPlaying && audioSystem.isPlaying()) {
+                audioSystem.stop();
             }
         });
         return unsubscribe;
