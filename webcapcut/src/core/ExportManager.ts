@@ -1,7 +1,9 @@
 /**
- * ExportManager - Handles video export using WebCodecs VideoEncoder and mp4-muxer
+ * ExportManager - Hybrid export using Web Worker for encoding
+ * Renders frames on main thread, sends to worker for encoding/muxing
+ * 
+ * PERFORMANCE LOGGING ENABLED - Check console for diagnostics
  */
-import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { ExportOptions } from '../types/video';
 import { useTimelineStore } from '../store/timelineStore';
 import { audioSystem } from './AudioSystem';
@@ -16,191 +18,315 @@ export interface ExportProgress {
 
 export type ProgressCallback = (progress: ExportProgress) => void;
 
+// Performance tracking
+interface PerformanceStats {
+    frameRenderTimes: number[];
+    frameSeekTimes: number[];
+    bitmapCreateTimes: number[];
+    totalStartTime: number;
+    workerInitTime: number;
+    videoRenderTime: number;
+    audioProcessTime: number;
+    slowFrames: number;
+}
+
 export class ExportManager {
-    private videoEncoder: VideoEncoder | null = null;
-    private audioEncoder: AudioEncoder | null = null;
-    private muxer: Muxer<ArrayBufferTarget> | null = null;
+    private worker: Worker | null = null;
     private cancelled = false;
     private onProgress: ProgressCallback | null = null;
+    private stats: PerformanceStats | null = null;
 
     /**
-     * Export timeline to MP4 blob
+     * Export timeline to MP4 blob using hybrid worker approach
      */
     async export(options: ExportOptions, onProgress?: ProgressCallback): Promise<Blob> {
         this.cancelled = false;
         this.onProgress = onProgress || null;
 
-        console.log('[ExportManager] Starting export...', options);
+        // Initialize performance stats
+        this.stats = {
+            frameRenderTimes: [],
+            frameSeekTimes: [],
+            bitmapCreateTimes: [],
+            totalStartTime: performance.now(),
+            workerInitTime: 0,
+            videoRenderTime: 0,
+            audioProcessTime: 0,
+            slowFrames: 0
+        };
+
+        console.log('╔════════════════════════════════════════════════════════════╗');
+        console.log('║           EXPORT STARTED - PERFORMANCE DIAGNOSTICS          ║');
+        console.log('╚════════════════════════════════════════════════════════════╝');
+        console.log('[Export] Settings:', {
+            resolution: `${options.width}x${options.height}`,
+            frameRate: options.frameRate,
+            videoBitrate: `${(options.videoBitrate / 1_000_000).toFixed(1)} Mbps`,
+            audioBitrate: `${(options.audioBitrate / 1000)} kbps`
+        });
+
         this.reportProgress({ percent: 0, currentFrame: 0, totalFrames: 0, stage: 'preparing' });
 
-        try {
-            // Get timeline data
-            const timelineState = useTimelineStore.getState();
-            const durationUs = timelineState.duration; // microseconds
-            const durationSec = durationUs / 1_000_000;
-            const totalFrames = Math.ceil(durationSec * options.frameRate);
+        return new Promise((resolve, reject) => {
+            try {
+                // Validate timeline data
+                const timelineState = useTimelineStore.getState();
+                const durationUs = timelineState.duration;
+                const durationSec = durationUs / 1_000_000;
+                const totalFrames = Math.ceil(durationSec * options.frameRate);
 
-            console.log(`[ExportManager] Duration: ${durationSec.toFixed(2)}s, Frames: ${totalFrames}`);
-
-            // Create muxer
-            this.muxer = new Muxer({
-                target: new ArrayBufferTarget(),
-                video: {
-                    codec: 'avc',
-                    width: options.width,
-                    height: options.height
-                },
-                audio: {
-                    codec: 'aac',
-                    numberOfChannels: 2,
-                    sampleRate: options.audioSampleRate
-                },
-                fastStart: 'in-memory'
-            });
-
-            // Create video encoder
-            this.videoEncoder = new VideoEncoder({
-                output: (chunk, meta) => {
-                    if (this.muxer && !this.cancelled) {
-                        this.muxer.addVideoChunk(chunk, meta);
-                    }
-                },
-                error: (e) => {
-                    console.error('[ExportManager] Video encoder error:', e);
-                    this.reportProgress({ percent: 0, currentFrame: 0, totalFrames, stage: 'error', error: e.message });
+                // Validation checks
+                if (durationSec <= 0) {
+                    throw new Error('❌ Timeline duration is 0 - no clips to export');
                 }
-            });
-
-            // Select AVC level based on resolution
-            // Level 3.1 (0x1f) = max 1280x720
-            // Level 4.0 (0x28) = max 1920x1080
-            // Level 4.1 (0x29) = max 2048x1024 or 1920x1088
-            // Level 5.1 (0x33) = max 4096x2160
-            const codecLevel = this.getAvcLevel(options.width, options.height);
-            console.log(`[ExportManager] Using codec: ${codecLevel}`);
-
-            await this.videoEncoder.configure({
-                codec: codecLevel,
-                width: options.width,
-                height: options.height,
-                bitrate: options.videoBitrate,
-                framerate: options.frameRate
-            });
-
-            // Create audio encoder
-            this.audioEncoder = new AudioEncoder({
-                output: (chunk, meta) => {
-                    if (this.muxer && !this.cancelled) {
-                        this.muxer.addAudioChunk(chunk, meta);
-                    }
-                },
-                error: (e) => {
-                    console.error('[ExportManager] Audio encoder error:', e);
-                }
-            });
-
-            await this.audioEncoder.configure({
-                codec: 'mp4a.40.2', // AAC-LC
-                numberOfChannels: 2,
-                sampleRate: options.audioSampleRate,
-                bitrate: options.audioBitrate
-            });
-
-            this.reportProgress({ percent: 5, currentFrame: 0, totalFrames, stage: 'encoding' });
-
-            // Create offscreen canvas for rendering
-            const offscreen = new OffscreenCanvas(options.width, options.height);
-            const ctx = offscreen.getContext('2d')!;
-
-            // Encode video frames
-            for (let frameNum = 0; frameNum < totalFrames; frameNum++) {
-                if (this.cancelled) {
-                    throw new Error('Export cancelled');
+                if (totalFrames > 10000) {
+                    console.warn('[Export] ⚠️ Large export:', totalFrames, 'frames. May take a while.');
                 }
 
-                const timeUs = (frameNum / options.frameRate) * 1_000_000;
-
-                // Get active clips at this time
-                const activeClips = timelineState.getActiveClips(timeUs);
-                const videoClip = activeClips.find(c => c.track.type === 'video');
-
-                // Render frame
-                ctx.fillStyle = '#000000';
-                ctx.fillRect(0, 0, options.width, options.height);
-
-                if (videoClip && videoClip.asset.videoElement) {
-                    const video = videoClip.asset.videoElement;
-                    const localTime = (timeUs - videoClip.segment.start + videoClip.clip.srcStart) / 1_000_000;
-
-                    // Seek video to correct time
-                    video.currentTime = Math.max(0, Math.min(localTime, video.duration));
-
-                    // Wait for video to seek
-                    await this.waitForVideoSeek(video);
-
-                    // Draw video to canvas with aspect ratio fit
-                    this.drawVideoFit(ctx, video, options.width, options.height);
-                }
-
-                // Create VideoFrame and encode
-                const videoFrame = new VideoFrame(offscreen, {
-                    timestamp: timeUs,
-                    duration: (1 / options.frameRate) * 1_000_000
+                console.log('[Export] Timeline info:', {
+                    duration: `${durationSec.toFixed(2)}s`,
+                    totalFrames,
+                    tracks: timelineState.tracks.length,
+                    clips: timelineState.clips.size,
+                    assets: timelineState.assets.size
                 });
 
-                const keyFrame = frameNum % 30 === 0; // Keyframe every 30 frames
-                this.videoEncoder.encode(videoFrame, { keyFrame });
-                videoFrame.close();
+                // Log video elements info
+                timelineState.assets.forEach((asset, id) => {
+                    if (asset.videoElement) {
+                        const v = asset.videoElement;
+                        console.log(`[Export] Asset ${id.substring(0, 8)}:`, {
+                            size: `${v.videoWidth}x${v.videoHeight}`,
+                            duration: `${v.duration.toFixed(2)}s`,
+                            readyState: v.readyState,
+                            hasAudio: audioSystem.hasAudioForAsset(id)
+                        });
+                    }
+                });
 
-                // Report progress
-                const percent = Math.round(5 + (frameNum / totalFrames) * 85);
-                this.reportProgress({ percent, currentFrame: frameNum + 1, totalFrames, stage: 'encoding' });
+                // Create worker
+                const workerStartTime = performance.now();
+                this.worker = new Worker(
+                    new URL('../workers/encoding.worker.ts', import.meta.url),
+                    { type: 'module' }
+                );
+
+                // Handle worker messages
+                this.worker.onmessage = async (e) => {
+                    const data = e.data;
+
+                    if (data.type === 'ready') {
+                        this.stats!.workerInitTime = performance.now() - workerStartTime;
+                        console.log(`[Export] ✓ Worker ready in ${this.stats!.workerInitTime.toFixed(0)}ms`);
+
+                        // Start sending frames
+                        const renderStart = performance.now();
+                        await this.renderAndSendFrames(options, totalFrames, durationSec, timelineState);
+                        this.stats!.videoRenderTime = performance.now() - renderStart;
+
+                    } else if (data.type === 'progress') {
+                        this.reportProgress({
+                            percent: data.percent,
+                            currentFrame: data.currentFrame,
+                            totalFrames: data.totalFrames,
+                            stage: 'encoding'
+                        });
+
+                        // Log every 30 frames
+                        if (data.currentFrame % 30 === 0) {
+                            console.log(`[Export] Frame ${data.currentFrame}/${data.totalFrames} (${data.percent}%)`);
+                        }
+
+                    } else if (data.type === 'complete') {
+                        const blob = new Blob([data.buffer], { type: 'video/mp4' });
+
+                        // Print performance report
+                        this.printPerformanceReport(blob, totalFrames);
+
+                        this.reportProgress({ percent: 100, currentFrame: totalFrames, totalFrames, stage: 'complete' });
+                        this.cleanup();
+                        resolve(blob);
+
+                    } else if (data.type === 'error') {
+                        console.error('[Export] ❌ Worker error:', data.error);
+                        this.reportProgress({ percent: 0, currentFrame: 0, totalFrames, stage: 'error', error: data.error });
+                        this.cleanup();
+                        reject(new Error(data.error));
+                    }
+                };
+
+                this.worker.onerror = (e) => {
+                    console.error('[Export] ❌ Worker crashed:', e);
+                    this.cleanup();
+                    reject(new Error('Worker crashed: ' + e.message));
+                };
+
+                // Initialize worker
+                this.worker.postMessage({
+                    type: 'init',
+                    width: options.width,
+                    height: options.height,
+                    frameRate: options.frameRate,
+                    videoBitrate: options.videoBitrate,
+                    totalFrames,
+                    audioSampleRate: options.audioSampleRate,
+                    audioBitrate: options.audioBitrate
+                });
+
+            } catch (error) {
+                console.error('[Export] ❌ Export failed:', error);
+                this.cleanup();
+                reject(error);
             }
-
-            // Flush video encoder
-            await this.videoEncoder.flush();
-
-            // Encode audio
-            await this.encodeAudio(options, durationSec);
-
-            // Flush audio encoder
-            await this.audioEncoder.flush();
-
-            this.reportProgress({ percent: 95, currentFrame: totalFrames, totalFrames, stage: 'muxing' });
-
-            // Finalize muxer
-            this.muxer.finalize();
-
-            // Get buffer and create blob
-            const buffer = this.muxer.target.buffer;
-            const blob = new Blob([buffer], { type: 'video/mp4' });
-
-            console.log(`[ExportManager] Export complete! Size: ${(blob.size / 1024 / 1024).toFixed(2)} MB`);
-            this.reportProgress({ percent: 100, currentFrame: totalFrames, totalFrames, stage: 'complete' });
-
-            this.cleanup();
-            return blob;
-
-        } catch (error) {
-            console.error('[ExportManager] Export failed:', error);
-            this.cleanup();
-            throw error;
-        }
+        });
     }
 
-    private async encodeAudio(options: ExportOptions, durationSec: number): Promise<void> {
-        if (!this.audioEncoder) return;
+    private async renderAndSendFrames(
+        options: ExportOptions,
+        totalFrames: number,
+        durationSec: number,
+        timelineState: ReturnType<typeof useTimelineStore.getState>
+    ): Promise<void> {
+        // Create offscreen canvas
+        const offscreen = new OffscreenCanvas(options.width, options.height);
+        const ctx = offscreen.getContext('2d');
 
-        const timelineState = useTimelineStore.getState();
+        if (!ctx) {
+            throw new Error('❌ Failed to create 2D context for export');
+        }
+
+        console.log('[Export] Starting frame rendering...');
+        console.log('[Export] Canvas:', options.width, 'x', options.height);
+
+        let frameNum = 0;
+        let lastLogTime = performance.now();
+
+        const renderNextFrame = async () => {
+            if (this.cancelled || !this.worker) {
+                console.log('[Export] ⚠️ Export cancelled at frame', frameNum);
+                return;
+            }
+
+            if (frameNum >= totalFrames) {
+                // Log final stats before audio
+                const avgRenderTime = this.stats!.frameRenderTimes.length > 0
+                    ? this.stats!.frameRenderTimes.reduce((a, b) => a + b, 0) / this.stats!.frameRenderTimes.length
+                    : 0;
+                console.log(`[Export] ✓ All ${totalFrames} frames rendered`);
+                console.log(`[Export] Avg frame time: ${avgRenderTime.toFixed(2)}ms, Slow frames: ${this.stats!.slowFrames}`);
+
+                // Send audio
+                const audioStart = performance.now();
+                await this.sendAudio(options, durationSec, timelineState);
+                this.stats!.audioProcessTime = performance.now() - audioStart;
+                console.log(`[Export] ✓ Audio processed in ${this.stats!.audioProcessTime.toFixed(0)}ms`);
+
+                this.worker.postMessage({ type: 'finish' });
+                return;
+            }
+
+            const frameStart = performance.now();
+            const timeUs = (frameNum / options.frameRate) * 1_000_000;
+            const activeClips = timelineState.getActiveClips(timeUs);
+            const videoClip = activeClips.find(c => c.track.type === 'video');
+
+            // Render frame
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, options.width, options.height);
+
+            let seekTime = 0;
+            if (videoClip && videoClip.asset.videoElement) {
+                const video = videoClip.asset.videoElement;
+                const localTime = (timeUs - videoClip.segment.start + videoClip.clip.srcStart) / 1_000_000;
+
+                // Validate video state
+                if (video.readyState < 2) {
+                    console.warn(`[Export] ⚠️ Frame ${frameNum}: Video not ready (state=${video.readyState})`);
+                }
+
+                // Seek video
+                const seekStart = performance.now();
+                video.currentTime = Math.max(0, Math.min(localTime, video.duration));
+                await this.waitForVideoSeek(video);
+                seekTime = performance.now() - seekStart;
+                this.stats!.frameSeekTimes.push(seekTime);
+
+                // Draw with aspect ratio fit
+                this.drawVideoFit(ctx, video, options.width, options.height);
+            } else if (frameNum < 5) {
+                console.log(`[Export] Frame ${frameNum}: No video clip at time ${(timeUs / 1000000).toFixed(2)}s`);
+            }
+
+            // Create bitmap and send to worker
+            try {
+                const bitmapStart = performance.now();
+                const bitmap = await createImageBitmap(offscreen);
+                const bitmapTime = performance.now() - bitmapStart;
+                this.stats!.bitmapCreateTimes.push(bitmapTime);
+
+                this.worker.postMessage({
+                    type: 'frame',
+                    bitmap,
+                    timestamp: timeUs,
+                    keyFrame: frameNum % 30 === 0
+                }, [bitmap]);
+
+            } catch (err) {
+                console.error(`[Export] ❌ Frame ${frameNum} error:`, err);
+            }
+
+            const frameTime = performance.now() - frameStart;
+            this.stats!.frameRenderTimes.push(frameTime);
+
+            // Track slow frames (>50ms)
+            if (frameTime > 50) {
+                this.stats!.slowFrames++;
+                if (this.stats!.slowFrames <= 5) {
+                    console.warn(`[Export] ⚠️ Slow frame ${frameNum}: ${frameTime.toFixed(0)}ms (seek: ${seekTime.toFixed(0)}ms)`);
+                }
+            }
+
+            // Log every 60 frames or every 2 seconds
+            const now = performance.now();
+            if (frameNum % 60 === 0 || now - lastLogTime > 2000) {
+                const fps = 60 / ((now - lastLogTime) / 1000);
+                console.log(`[Export] Progress: ${frameNum}/${totalFrames} frames, ${fps.toFixed(1)} effective fps`);
+                lastLogTime = now;
+            }
+
+            frameNum++;
+
+            // Yield to event loop (adjustable delay)
+            setTimeout(renderNextFrame, 0);
+        };
+
+        // Start
+        renderNextFrame();
+    }
+
+    private async sendAudio(
+        options: ExportOptions,
+        durationSec: number,
+        timelineState: ReturnType<typeof useTimelineStore.getState>
+    ): Promise<void> {
+        if (!this.worker) return;
+
         const sampleRate = options.audioSampleRate;
         const totalSamples = Math.ceil(durationSec * sampleRate);
-        const numberOfChannels = 2;
 
-        // Create separate channel buffers for planar format
+        console.log('[Export] Processing audio:', {
+            sampleRate,
+            totalSamples,
+            duration: `${durationSec.toFixed(2)}s`
+        });
+
+        // Create separate channel buffers
         const leftChannel = new Float32Array(totalSamples);
         const rightChannel = new Float32Array(totalSamples);
 
-        // For each clip with audio, add to mix
+        let clipsWithAudio = 0;
+
+        // Mix audio from all clips
         for (const track of timelineState.tracks) {
             for (const segment of track.segments) {
                 if (segment.type !== 'clip') continue;
@@ -214,7 +340,8 @@ export class ExportManager {
                 const audioBuffer = audioSystem.getBufferForAsset(asset.id);
                 if (!audioBuffer) continue;
 
-                // Calculate sample positions
+                clipsWithAudio++;
+
                 const clipStartSec = segment.start / 1_000_000;
                 const clipDurSec = segment.duration / 1_000_000;
                 const srcStartSec = clip.srcStart / 1_000_000;
@@ -223,7 +350,6 @@ export class ExportManager {
                 const numSamples = Math.floor(clipDurSec * sampleRate);
                 const srcStartSample = Math.floor(srcStartSec * audioBuffer.sampleRate);
 
-                // Copy audio data to separate channel buffers
                 for (let i = 0; i < numSamples; i++) {
                     const destIdx = destStartSample + i;
                     const srcIdx = srcStartSample + i;
@@ -240,53 +366,84 @@ export class ExportManager {
             }
         }
 
-        // Normalize (clip to -1..1)
+        console.log(`[Export] Mixed ${clipsWithAudio} clips with audio`);
+
+        // Normalize
+        let maxSample = 0;
         for (let i = 0; i < totalSamples; i++) {
             leftChannel[i] = Math.max(-1, Math.min(1, leftChannel[i]));
             rightChannel[i] = Math.max(-1, Math.min(1, rightChannel[i]));
+            maxSample = Math.max(maxSample, Math.abs(leftChannel[i]), Math.abs(rightChannel[i]));
         }
+        console.log(`[Export] Audio peak level: ${(maxSample * 100).toFixed(1)}%`);
 
-        // Encode audio in chunks - using planar format properly
-        const samplesPerChunk = sampleRate; // 1 second chunks
-        const chunksTotal = Math.ceil(totalSamples / samplesPerChunk);
+        // Send to worker
+        this.worker.postMessage({
+            type: 'audio',
+            leftChannel,
+            rightChannel,
+            sampleRate,
+            totalSamples
+        }, [leftChannel.buffer, rightChannel.buffer]);
+    }
 
-        for (let chunkIdx = 0; chunkIdx < chunksTotal; chunkIdx++) {
-            if (this.cancelled) break;
+    private printPerformanceReport(blob: Blob, totalFrames: number): void {
+        if (!this.stats) return;
 
-            const startSample = chunkIdx * samplesPerChunk;
-            const endSample = Math.min(startSample + samplesPerChunk, totalSamples);
-            const chunkSamples = endSample - startSample;
+        const totalTime = performance.now() - this.stats.totalStartTime;
+        const avgFrameTime = this.stats.frameRenderTimes.length > 0
+            ? this.stats.frameRenderTimes.reduce((a, b) => a + b, 0) / this.stats.frameRenderTimes.length
+            : 0;
+        const avgSeekTime = this.stats.frameSeekTimes.length > 0
+            ? this.stats.frameSeekTimes.reduce((a, b) => a + b, 0) / this.stats.frameSeekTimes.length
+            : 0;
+        const avgBitmapTime = this.stats.bitmapCreateTimes.length > 0
+            ? this.stats.bitmapCreateTimes.reduce((a, b) => a + b, 0) / this.stats.bitmapCreateTimes.length
+            : 0;
+        const maxFrameTime = Math.max(...this.stats.frameRenderTimes, 0);
 
-            // Create planar data: [all left samples][all right samples]
-            const chunkData = new Float32Array(chunkSamples * numberOfChannels);
+        console.log('╔════════════════════════════════════════════════════════════╗');
+        console.log('║              EXPORT COMPLETE - PERFORMANCE REPORT           ║');
+        console.log('╠════════════════════════════════════════════════════════════╣');
+        console.log(`║ Output size:     ${(blob.size / 1024 / 1024).toFixed(2)} MB`);
+        console.log(`║ Total time:      ${(totalTime / 1000).toFixed(2)}s`);
+        console.log(`║ Total frames:    ${totalFrames}`);
+        console.log(`║ Effective FPS:   ${(totalFrames / (totalTime / 1000)).toFixed(1)}`);
+        console.log('╠════════════════════════════════════════════════════════════╣');
+        console.log(`║ Avg frame time:   ${avgFrameTime.toFixed(2)}ms`);
+        console.log(`║ Avg seek time:    ${avgSeekTime.toFixed(2)}ms`);
+        console.log(`║ Avg bitmap time:  ${avgBitmapTime.toFixed(2)}ms`);
+        console.log(`║ Max frame time:   ${maxFrameTime.toFixed(2)}ms`);
+        console.log(`║ Slow frames:      ${this.stats.slowFrames} (>${50}ms)`);
+        console.log('╠════════════════════════════════════════════════════════════╣');
+        console.log(`║ Worker init:      ${this.stats.workerInitTime.toFixed(0)}ms`);
+        console.log(`║ Audio process:    ${this.stats.audioProcessTime.toFixed(0)}ms`);
+        console.log('╠════════════════════════════════════════════════════════════╣');
 
-            // Copy left channel
-            for (let i = 0; i < chunkSamples; i++) {
-                chunkData[i] = leftChannel[startSample + i];
-            }
-            // Copy right channel
-            for (let i = 0; i < chunkSamples; i++) {
-                chunkData[chunkSamples + i] = rightChannel[startSample + i];
-            }
-
-            const audioData = new AudioData({
-                format: 'f32-planar',
-                sampleRate: sampleRate,
-                numberOfFrames: chunkSamples,
-                numberOfChannels: numberOfChannels,
-                timestamp: (startSample / sampleRate) * 1_000_000,
-                data: chunkData
-            });
-
-            this.audioEncoder.encode(audioData);
-            audioData.close();
+        // Tuning recommendations
+        console.log('║ TUNING RECOMMENDATIONS:');
+        if (avgSeekTime > 30) {
+            console.log('║ ⚠️ High seek time - video decoding is slow');
+            console.log('║    → Consider using proxy videos (720p)');
         }
+        if (this.stats.slowFrames > totalFrames * 0.1) {
+            console.log('║ ⚠️ Many slow frames - CPU bottleneck');
+            console.log('║    → Try lower resolution export');
+        }
+        if (avgBitmapTime > 10) {
+            console.log('║ ⚠️ Bitmap creation slow');
+            console.log('║    → GPU may be overloaded');
+        }
+        if (totalTime / 1000 > totalFrames / 30 * 3) {
+            console.log('║ ⚠️ Export taking 3x longer than realtime');
+            console.log('║    → Consider reducing quality settings');
+        }
+        console.log('╚════════════════════════════════════════════════════════════╝');
     }
 
     private drawVideoFit(ctx: OffscreenCanvasRenderingContext2D, video: HTMLVideoElement, canvasW: number, canvasH: number): void {
         const videoW = video.videoWidth;
         const videoH = video.videoHeight;
-
         if (!videoW || !videoH) return;
 
         const videoAR = videoW / videoH;
@@ -295,13 +452,11 @@ export class ExportManager {
         let drawW: number, drawH: number, drawX: number, drawY: number;
 
         if (videoAR > canvasAR) {
-            // Video is wider - fit to width
             drawW = canvasW;
             drawH = canvasW / videoAR;
             drawX = 0;
             drawY = (canvasH - drawH) / 2;
         } else {
-            // Video is taller - fit to height
             drawH = canvasH;
             drawW = canvasH * videoAR;
             drawX = (canvasW - drawW) / 2;
@@ -323,9 +478,7 @@ export class ExportManager {
                 resolve();
             };
             video.addEventListener('seeked', onSeeked);
-
-            // Timeout fallback
-            setTimeout(resolve, 100);
+            setTimeout(resolve, 50);
         });
     }
 
@@ -336,47 +489,17 @@ export class ExportManager {
     }
 
     cancel(): void {
-        console.log('[ExportManager] Export cancelled');
+        console.log('[Export] ⚠️ Export cancelled by user');
         this.cancelled = true;
+        this.cleanup();
     }
 
     private cleanup(): void {
-        if (this.videoEncoder) {
-            try { this.videoEncoder.close(); } catch { }
-            this.videoEncoder = null;
+        if (this.worker) {
+            this.worker.terminate();
+            this.worker = null;
         }
-        if (this.audioEncoder) {
-            try { this.audioEncoder.close(); } catch { }
-            this.audioEncoder = null;
-        }
-        this.muxer = null;
-    }
-
-    /**
-     * Get appropriate AVC codec string based on resolution
-     * Format: avc1.PPCCLL where PP=profile, CC=constraints, LL=level
-     * Using High Profile (64) for best quality
-     */
-    private getAvcLevel(width: number, height: number): string {
-        const pixels = width * height;
-
-        // AVC Level reference (High Profile):
-        // Level 3.1 (1f): max 921,600 pixels (1280x720)
-        // Level 4.0 (28): max 2,097,152 pixels (1920x1080)
-        // Level 4.1 (29): max 2,097,152 pixels (for higher framerates)
-        // Level 5.0 (32): max 8,912,896 pixels (4096x2048)
-        // Level 5.1 (33): max 8,912,896 pixels (4096x2160)
-
-        if (pixels <= 921600) {
-            // 720p and below
-            return 'avc1.64001f'; // High Profile, Level 3.1
-        } else if (pixels <= 2097152) {
-            // 1080p
-            return 'avc1.640029'; // High Profile, Level 4.1
-        } else {
-            // 4K
-            return 'avc1.640033'; // High Profile, Level 5.1
-        }
+        this.stats = null;
     }
 }
 

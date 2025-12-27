@@ -40,6 +40,13 @@ export function ExportDialog({ isOpen, onClose }: ExportDialogProps) {
         setProgress(null);
         setDownloadUrl(null);
 
+        // Pause playback during export to free resources
+        const { usePlaybackStore } = await import('../../store/playbackStore');
+        const wasPlaying = usePlaybackStore.getState().isPlaying;
+        if (wasPlaying) {
+            usePlaybackStore.getState().pause();
+        }
+
         try {
             const blob = await exportManager.export(selectedPreset.options, (p) => {
                 setProgress(p);
