@@ -62,6 +62,19 @@ export class MultiVideoManager {
     }
 
     /**
+     * Register a pre-loaded video element by asset ID
+     * Use this when you already have a loaded HTMLVideoElement
+     */
+    registerVideo(assetId: string, videoElement: HTMLVideoElement): void {
+        if (this.videos.has(assetId)) {
+            console.log(`[MultiVideoManager] Video already registered: ${assetId}`);
+            return;
+        }
+        this.videos.set(assetId, videoElement);
+        console.log(`[MultiVideoManager] ✅ Registered video: ${assetId}`);
+    }
+
+    /**
      * Set the currently active video (for render source)
      */
     setActiveVideo(assetId: string): boolean {

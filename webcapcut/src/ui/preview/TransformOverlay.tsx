@@ -97,6 +97,7 @@ export function TransformOverlay({
                 top: displayBounds.y,
                 width: displayBounds.width,
                 height: displayBounds.height,
+                zIndex: 15,  // Above FrameBoundary (z-index: 10)
             }}
         >
             {/* Bounding box */}

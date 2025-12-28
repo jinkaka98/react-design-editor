@@ -1,6 +1,9 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
-import { WebGPUContext } from '../core/WebGPUContext';
-import { CanvasRenderer } from '../core/CanvasRenderer';
+/**
+ * VideoPlayer - Multi-track video playback with 2D compositing
+ * Now supports rendering multiple video layers simultaneously
+ */
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { CompositeRenderer, VideoLayer, getCompositeRenderer } from '../core/CompositeRenderer';
 import { usePlaybackStore } from '../store/playbackStore';
 import { useTimelineStore } from '../store/timelineStore';
 import { useProjectStore } from '../store/projectStore';
@@ -10,7 +13,6 @@ import { TransformOverlay } from './preview/TransformOverlay';
 import { TransformPreview } from './preview/TransformPreview';
 import { CanvasGuides } from './preview/CanvasGuides';
 import { FrameBoundary } from './preview/FrameBoundary';
-import videoShaderCode from '../core/shaders/video.wgsl?raw';
 import { audioSystem } from '../core/AudioSystem';
 import { perfMonitor } from '../utils/PerformanceMonitor';
 
@@ -21,19 +23,19 @@ export function VideoPlayer() {
     const [error, setError] = useState<string | null>(null);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const setDuration = usePlaybackStore(state => state.setDuration);
-    const rendererRef = useRef<CanvasRenderer | null>(null);
-    const gpuRef = useRef<WebGPUContext | null>(null);
+    const rendererRef = useRef<CompositeRenderer | null>(null);
+
+    // Store refs for active layers - updated by sync effect
+    const activeLayersRef = useRef<VideoLayer[]>([]);
 
     // Get active clips from timeline
     const getActiveClips = useTimelineStore(state => state.getActiveClips);
     const timelineDuration = useTimelineStore(state => state.duration);
+    const tracks = useTimelineStore(state => state.tracks);
 
     // Get project resolution
     const projectWidth = useProjectStore(state => state.settings.width);
     const projectHeight = useProjectStore(state => state.settings.height);
-
-    // Current active video element
-    const activeVideoRef = useRef<HTMLVideoElement | null>(null);
 
     // Track container size with ResizeObserver
     useEffect(() => {
@@ -49,30 +51,23 @@ export function VideoPlayer() {
         return () => observer.disconnect();
     }, []);
 
-    // Calculate display size that fits within container while maintaining aspect ratio
+    // Calculate display size maintaining aspect ratio
     const displaySize = useMemo(() => {
-        // Add padding for visual breathing room
-        const padding = 32;
-        const availableWidth = Math.max(100, containerSize.width - padding);
-        const availableHeight = Math.max(100, containerSize.height - padding);
-
-        if (!availableWidth || !availableHeight) {
-            return { width: projectWidth, height: projectHeight };
+        if (containerSize.width === 0 || containerSize.height === 0) {
+            return { width: 640, height: 360 };
         }
 
-        const containerAR = availableWidth / availableHeight;
-        const projectAR = projectWidth / projectHeight;
+        const containerAspect = containerSize.width / containerSize.height;
+        const projectAspect = projectWidth / projectHeight;
 
         let displayWidth: number, displayHeight: number;
 
-        if (projectAR > containerAR) {
-            // Project is wider - fit to container width
-            displayWidth = availableWidth;
-            displayHeight = availableWidth / projectAR;
+        if (containerAspect > projectAspect) {
+            displayHeight = Math.min(containerSize.height * 0.95, projectHeight);
+            displayWidth = displayHeight * projectAspect;
         } else {
-            // Project is taller - fit to container height
-            displayHeight = availableHeight;
-            displayWidth = availableHeight * projectAR;
+            displayWidth = Math.min(containerSize.width * 0.95, projectWidth);
+            displayHeight = displayWidth / projectAspect;
         }
 
         return {
@@ -84,75 +79,111 @@ export function VideoPlayer() {
     // Enable keyboard shortcuts
     useKeyboardShortcuts();
 
-    // Sync playback with timeline clips
+    // Build video layers from active clips - memoized for efficiency
+    const buildVideoLayers = useCallback((currentTime: number): VideoLayer[] => {
+        const activeClips = getActiveClips(currentTime);
+
+        // Debug: Log active clips from store
+        console.log(`[VideoPlayer] 🔍 getActiveClips returned ${activeClips.length} clips at time ${(currentTime / 1_000_000).toFixed(2)}s`);
+        activeClips.forEach((c, i) => {
+            console.log(`  Clip ${i}: track=${c.track.id}, asset=${c.asset.id}, type=${c.track.type}, hasVideo=${!!c.asset.videoElement}`);
+        });
+
+        if (activeClips.length === 0) {
+            return [];
+        }
+
+        // Build layer array with debug validation
+        const layers: VideoLayer[] = [];
+
+        for (const clipData of activeClips) {
+            const { track, asset, clip } = clipData;
+
+            // Validate video element
+            if (!asset.videoElement) {
+                console.warn(`[VideoPlayer] ⚠️ No videoElement for asset: ${asset.id}`);
+                continue;
+            }
+
+            // Get track index (for layer ordering)
+            const trackIndex = tracks.findIndex(t => t.id === track.id);
+            if (trackIndex === -1) {
+                console.warn(`[VideoPlayer] ⚠️ Track not found: ${track.id}`);
+                continue;
+            }
+
+            // Only include video tracks
+            if (track.type !== 'video') {
+                console.log(`[VideoPlayer] ⏭️ Skipping non-video track: ${track.id} (type=${track.type})`);
+                continue;
+            }
+
+            const layer: VideoLayer = {
+                video: asset.videoElement,
+                trackIndex,
+                transform: clip.transform,
+                assetId: asset.id,
+                clipId: clip.id
+            };
+
+            layers.push(layer);
+            console.log(`[VideoPlayer] ✅ Added layer: trackIndex=${trackIndex}, asset=${asset.id}`);
+        }
+
+        console.log(`[VideoPlayer] 📊 Final layer count: ${layers.length}`);
+        return layers;
+    }, [getActiveClips, tracks]);
+
+    // Sync playback with timeline - updates all active videos
     useEffect(() => {
         let lastAudioUpdate = 0;
 
         const unsubscribe = usePlaybackStore.subscribe((state) => {
             const syncStart = performance.now();
 
-            // Track clip fetching time
-            const clipFetchStart = performance.now();
-            const activeClips = getActiveClips(state.currentTime);
-            const clipFetchTime = performance.now() - clipFetchStart;
+            // Build layers for current time
+            const layers = buildVideoLayers(state.currentTime);
+            activeLayersRef.current = layers;
 
-            if (clipFetchTime > 2) {
-                perfMonitor.recordMetric('VideoPlayer', 'getActiveClips', clipFetchTime, {
-                    clipCount: activeClips.length,
-                    time: state.currentTime / 1_000_000
-                });
-            }
+            // Sync each video element
+            for (const layer of layers) {
+                const video = layer.video;
 
-            // Get first video clip's video element (for preview rendering)
-            const firstVideoClip = activeClips.find(c => c.track.type === 'video');
+                // Get clip data for time calculation
+                const activeClips = getActiveClips(state.currentTime);
+                const clipData = activeClips.find(c => c.asset.id === layer.assetId);
 
-            if (firstVideoClip && firstVideoClip.asset.videoElement) {
-                const video = firstVideoClip.asset.videoElement;
-                activeVideoRef.current = video;
+                if (!clipData) continue;
 
-                // Calculate time within clip (local time in source video)
-                const clipLocalTime = (state.currentTime - firstVideoClip.segment.start + firstVideoClip.clip.srcStart) / 1_000_000;
+                // Calculate local time in source video
+                const clipLocalTime = (state.currentTime - clipData.segment.start + clipData.clip.srcStart) / 1_000_000;
 
-                // Sync video time (increased threshold from 0.1 to 0.3)
+                // Sync video time (threshold 0.3s)
                 const timeDiff = Math.abs(video.currentTime - clipLocalTime);
                 if (timeDiff > 0.3) {
-                    const seekStart = performance.now();
                     video.currentTime = Math.max(0, Math.min(clipLocalTime, video.duration || Infinity));
-                    perfMonitor.recordMetric('VideoPlayer', 'videoSeek', performance.now() - seekStart, {
-                        from: video.currentTime,
-                        to: clipLocalTime,
-                        diff: timeDiff
-                    });
                 }
 
                 // Sync play state
                 if (state.isPlaying && video.paused) {
                     video.playbackRate = state.playbackRate;
                     video.play().catch(() => { });
-                    perfMonitor.log('VideoPlayer', 'play started', { rate: state.playbackRate });
                 } else if (!state.isPlaying && !video.paused) {
                     video.pause();
-                    perfMonitor.log('VideoPlayer', 'paused');
                 }
 
                 // Sync playback rate
                 if (video.playbackRate !== state.playbackRate) {
                     video.playbackRate = state.playbackRate;
                 }
-            } else {
-                // No active clip - pause any playing video
-                if (activeVideoRef.current && !activeVideoRef.current.paused) {
-                    activeVideoRef.current.pause();
-                }
-                activeVideoRef.current = null;
             }
 
-            // Multi-track audio: throttle updates to every 100ms
+            // Multi-track audio update (throttled)
             const now = performance.now();
             if (state.isPlaying && now - lastAudioUpdate > 100) {
                 lastAudioUpdate = now;
 
-                const audioStart = performance.now();
+                const activeClips = getActiveClips(state.currentTime);
                 const audioClipData = activeClips
                     .filter(c => audioSystem.hasAudioForAsset(c.asset.id))
                     .map(c => ({
@@ -164,28 +195,18 @@ export function VideoPlayer() {
                     audioSystem.play();
                 }
                 audioSystem.updateActiveClips(audioClipData);
-
-                const audioUpdateTime = performance.now() - audioStart;
-                if (audioUpdateTime > 5) {
-                    perfMonitor.recordMetric('VideoPlayer', 'audioUpdate', audioUpdateTime, {
-                        clipCount: audioClipData.length
-                    });
-                }
             } else if (!state.isPlaying && audioSystem.isPlaying()) {
                 audioSystem.stop();
             }
 
-            // Track total sync time
-            const totalSyncTime = performance.now() - syncStart;
-            if (totalSyncTime > 10) {
-                perfMonitor.recordMetric('VideoPlayer', 'syncLoop', totalSyncTime, {
-                    isPlaying: state.isPlaying,
-                    clips: activeClips.length
-                });
+            const syncTime = performance.now() - syncStart;
+            if (syncTime > 10) {
+                perfMonitor.recordMetric('VideoPlayer', 'syncLoop', syncTime, { layers: layers.length });
             }
         });
+
         return unsubscribe;
-    }, [getActiveClips]);
+    }, [buildVideoLayers, getActiveClips]);
 
     // Update duration from timeline
     useEffect(() => {
@@ -194,51 +215,31 @@ export function VideoPlayer() {
         }
     }, [timelineDuration, setDuration]);
 
-    // Reset transform when resolution changes
+    // Initialize CompositeRenderer
     useEffect(() => {
-        if (rendererRef.current) {
-            rendererRef.current.resetTransformCache();
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        try {
+            setStatus('Initializing...');
+
+            const renderer = getCompositeRenderer();
+            renderer.init(canvas);
+            rendererRef.current = renderer;
+
+            // Start render loop - pass layer getter function
+            renderer.startRenderLoop(() => activeLayersRef.current);
+
+            setStatus('');
+            console.log('[VideoPlayer] ✅ CompositeRenderer initialized');
+        } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            console.error('[VideoPlayer] ❌ Init error:', errorMessage);
+            setError(errorMessage);
+            setStatus('Error');
         }
-    }, [projectWidth, projectHeight]);
-
-    // Initialize WebGPU and renderer
-    useEffect(() => {
-        let mounted = true;
-
-        async function init() {
-            try {
-                const canvas = canvasRef.current;
-                if (!canvas) return;
-
-                setStatus('Initializing WebGPU...');
-                const gpu = await WebGPUContext.init(canvas);
-                gpuRef.current = gpu;
-
-                const renderer = new CanvasRenderer();
-                await renderer.init(gpu, videoShaderCode);
-                rendererRef.current = renderer;
-
-                // Start render loop - get video from active clip
-                renderer.startRenderLoop(gpu, () => activeVideoRef.current);
-
-                if (mounted) {
-                    setStatus('');
-                    console.log('[VideoPlayer] ✅ Initialized');
-                }
-            } catch (err) {
-                if (mounted) {
-                    const errorMessage = err instanceof Error ? err.message : String(err);
-                    console.error('[VideoPlayer] Error:', errorMessage);
-                    setError(errorMessage);
-                    setStatus('Error');
-                }
-            }
-        }
-
-        init();
 
         return () => {
-            mounted = false;
             rendererRef.current?.stop();
         };
     }, []);
@@ -252,45 +253,42 @@ export function VideoPlayer() {
                 </div>
             )}
 
-            {/* Video canvas container - tracks available space */}
+            {/* Video canvas container */}
             <div
                 ref={containerRef}
                 className="flex-1 flex items-center justify-center bg-black overflow-hidden"
             >
-                {/* Wrapper for canvas + overlay positioning */}
+                {/* Wrapper for canvas + overlays */}
                 <div className="relative">
                     <canvas
                         ref={canvasRef}
-                        // Internal resolution for GPU rendering quality
                         width={projectWidth}
                         height={projectHeight}
                         className="shadow-2xl"
                         style={{
-                            // Display size - fits within container
                             width: `${displaySize.width}px`,
                             height: `${displaySize.height}px`,
-                            // Border to show aspect ratio boundaries
                             border: '1px solid #444',
                         }}
                     />
-                    {/* Frame boundary - ALWAYS visible to show preset limits */}
+                    {/* Frame boundary - ALWAYS visible */}
                     <FrameBoundary
                         displayWidth={displaySize.width}
                         displayHeight={displaySize.height}
                     />
-                    {/* Canvas guides - center, rule of thirds (only when clip selected) */}
+                    {/* Canvas guides (only when clip selected) */}
                     <CanvasGuides
                         displayWidth={displaySize.width}
                         displayHeight={displaySize.height}
                     />
-                    {/* Transform preview layer - shows video with transform applied */}
+                    {/* Transform preview (for selected clip) */}
                     <TransformPreview
                         canvasWidth={projectWidth}
                         canvasHeight={projectHeight}
                         displayWidth={displaySize.width}
                         displayHeight={displaySize.height}
                     />
-                    {/* Transform overlay for selected clip */}
+                    {/* Transform overlay (handles) */}
                     <TransformOverlay
                         canvasWidth={projectWidth}
                         canvasHeight={projectHeight}
@@ -299,7 +297,7 @@ export function VideoPlayer() {
                 </div>
             </div>
 
-            {/* Mini controls */}
+            {/* Playback controls */}
             <PlaybackControls />
         </div>
     );
