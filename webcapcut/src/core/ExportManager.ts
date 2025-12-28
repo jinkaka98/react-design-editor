@@ -8,6 +8,8 @@ import { ExportOptions } from '../types/video';
 import { useTimelineStore } from '../store/timelineStore';
 import { audioSystem } from './AudioSystem';
 import { perfMonitor } from '../utils/PerformanceMonitor';
+import { drawWithTransform } from '../utils/clipTransform';
+import type { ClipTransform } from '../types/timeline';
 
 export interface ExportProgress {
     percent: number;
@@ -280,7 +282,7 @@ export class ExportManager {
 
                 // Only draw if video frame is ready
                 if (video.readyState >= 2) {
-                    this.drawVideoFit(ctx, video, options.width, options.height);
+                    this.drawVideoFit(ctx, video, options.width, options.height, videoClip.clip.transform);
                 } else {
                     console.warn(`[Export] ⚠️ Frame ${frameNum}: Skipped - video not ready`);
                 }
@@ -479,29 +481,19 @@ export class ExportManager {
         console.log('╚════════════════════════════════════════════════════════════╝');
     }
 
-    private drawVideoFit(ctx: OffscreenCanvasRenderingContext2D, video: HTMLVideoElement, canvasW: number, canvasH: number): void {
+    private drawVideoFit(
+        ctx: OffscreenCanvasRenderingContext2D,
+        video: HTMLVideoElement,
+        canvasW: number,
+        canvasH: number,
+        transform?: ClipTransform
+    ): void {
         const videoW = video.videoWidth;
         const videoH = video.videoHeight;
         if (!videoW || !videoH) return;
 
-        const videoAR = videoW / videoH;
-        const canvasAR = canvasW / canvasH;
-
-        let drawW: number, drawH: number, drawX: number, drawY: number;
-
-        if (videoAR > canvasAR) {
-            drawW = canvasW;
-            drawH = canvasW / videoAR;
-            drawX = 0;
-            drawY = (canvasH - drawH) / 2;
-        } else {
-            drawH = canvasH;
-            drawW = canvasH * videoAR;
-            drawX = (canvasW - drawW) / 2;
-            drawY = 0;
-        }
-
-        ctx.drawImage(video, drawX, drawY, drawW, drawH);
+        // Use unified transform utility
+        drawWithTransform(ctx, video, canvasW, canvasH, videoW, videoH, transform);
     }
 
     /**

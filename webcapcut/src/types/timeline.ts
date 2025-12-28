@@ -52,6 +52,29 @@ export interface Asset {
 }
 
 /**
+ * Transform properties for a clip (position, scale, rotation)
+ * Values are normalized: position -1 to 1 (0 = center), scale 1 = 100%
+ */
+export interface ClipTransform {
+    x: number;         // Position offset X (-1 to 1, 0 = center)
+    y: number;         // Position offset Y (-1 to 1, 0 = center)
+    scaleX: number;    // Horizontal scale (1.0 = 100%)
+    scaleY: number;    // Vertical scale (1.0 = 100%)
+    rotation: number;  // Rotation in degrees (0-360)
+}
+
+/**
+ * Default transform (centered, no transform)
+ */
+export const DEFAULT_CLIP_TRANSFORM: ClipTransform = {
+    x: 0,
+    y: 0,
+    scaleX: 1,
+    scaleY: 1,
+    rotation: 0
+};
+
+/**
  * Clip data - references source media with in/out points
  */
 export interface ClipData {
@@ -59,6 +82,7 @@ export interface ClipData {
     assetId: string;           // Reference to source Asset
     srcStart: number;          // Start time in source media (microseconds)
     srcEnd: number;            // End time in source media (microseconds)
+    transform?: ClipTransform; // Optional transform (default = centered)
 }
 
 // ============================================================================
@@ -75,8 +99,10 @@ export interface Track {
     name: string;              // e.g., "V1", "V2", "A1"
     segments: TimelineSegment[];  // Ordered segments (clips and gaps)
     muted: boolean;
+    solo: boolean;             // Solo mode - only this track plays
     locked: boolean;
     height: number;            // Track height in pixels
+    volume: number;            // Track volume 0.0 - 1.0 (default 1.0)
 }
 
 // ============================================================================
@@ -92,6 +118,7 @@ export interface TimelineState {
     clips: Map<string, ClipData>;  // Central clip registry
     selectedSegmentId: string | null;
     selectedTrackId: string | null;
+    selectedClipId: string | null;  // For transform overlay
     duration: number;          // Total timeline duration
     zoom: number;              // Pixels per second
     scrollX: number;           // Horizontal scroll position (pixels)

@@ -118,7 +118,7 @@ export function Timeline() {
 
             {/* Ruler */}
             <div className="flex flex-shrink-0">
-                <div className="w-20 flex-shrink-0 bg-gray-800 border-r border-gray-700" />
+                <div className="w-24 flex-shrink-0 bg-gray-800 border-r border-gray-700" />
                 <div className="flex-1">
                     <TimelineRuler width={containerWidth} />
                 </div>
@@ -152,10 +152,10 @@ export function Timeline() {
                     <div
                         className="absolute pointer-events-none bg-blue-500/50 border-2 border-blue-400 rounded"
                         style={{
-                            left: ((dragState.segmentInitialStart + getDragDelta()) / 1_000_000) * zoom - scrollX + 80,
+                            left: ((dragState.segmentInitialStart + getDragDelta()) / 1_000_000) * zoom - scrollX + 96,
                             width: (dragState.segmentDuration / 1_000_000) * zoom,
-                            height: 52,
-                            top: tracks.findIndex(t => t.id === dragState.fromTrackId) * 60 + 4,
+                            height: 72,
+                            top: tracks.findIndex(t => t.id === dragState.fromTrackId) * 80 + 4,
                         }}
                     >
                         <div className="px-2 py-1 text-xs text-white truncate">

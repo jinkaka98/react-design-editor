@@ -6,6 +6,10 @@ import { useTimelineStore } from '../store/timelineStore';
 import { useProjectStore } from '../store/projectStore';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { PlaybackControls } from './controls/PlaybackControls';
+import { TransformOverlay } from './preview/TransformOverlay';
+import { TransformPreview } from './preview/TransformPreview';
+import { CanvasGuides } from './preview/CanvasGuides';
+import { FrameBoundary } from './preview/FrameBoundary';
 import videoShaderCode from '../core/shaders/video.wgsl?raw';
 import { audioSystem } from '../core/AudioSystem';
 import { perfMonitor } from '../utils/PerformanceMonitor';
@@ -253,20 +257,46 @@ export function VideoPlayer() {
                 ref={containerRef}
                 className="flex-1 flex items-center justify-center bg-black overflow-hidden"
             >
-                <canvas
-                    ref={canvasRef}
-                    // Internal resolution for GPU rendering quality
-                    width={projectWidth}
-                    height={projectHeight}
-                    className="shadow-2xl"
-                    style={{
-                        // Display size - fits within container
-                        width: `${displaySize.width}px`,
-                        height: `${displaySize.height}px`,
-                        // Border to show aspect ratio boundaries
-                        border: '1px solid #444',
-                    }}
-                />
+                {/* Wrapper for canvas + overlay positioning */}
+                <div className="relative">
+                    <canvas
+                        ref={canvasRef}
+                        // Internal resolution for GPU rendering quality
+                        width={projectWidth}
+                        height={projectHeight}
+                        className="shadow-2xl"
+                        style={{
+                            // Display size - fits within container
+                            width: `${displaySize.width}px`,
+                            height: `${displaySize.height}px`,
+                            // Border to show aspect ratio boundaries
+                            border: '1px solid #444',
+                        }}
+                    />
+                    {/* Frame boundary - ALWAYS visible to show preset limits */}
+                    <FrameBoundary
+                        displayWidth={displaySize.width}
+                        displayHeight={displaySize.height}
+                    />
+                    {/* Canvas guides - center, rule of thirds (only when clip selected) */}
+                    <CanvasGuides
+                        displayWidth={displaySize.width}
+                        displayHeight={displaySize.height}
+                    />
+                    {/* Transform preview layer - shows video with transform applied */}
+                    <TransformPreview
+                        canvasWidth={projectWidth}
+                        canvasHeight={projectHeight}
+                        displayWidth={displaySize.width}
+                        displayHeight={displaySize.height}
+                    />
+                    {/* Transform overlay for selected clip */}
+                    <TransformOverlay
+                        canvasWidth={projectWidth}
+                        canvasHeight={projectHeight}
+                        displayScale={displaySize.width / projectWidth}
+                    />
+                </div>
             </div>
 
             {/* Mini controls */}

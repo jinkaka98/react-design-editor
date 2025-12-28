@@ -23,6 +23,7 @@ export function TimelineClip({
 }: TimelineClipProps) {
     const selectedSegmentId = useTimelineStore(state => state.selectedSegmentId);
     const selectSegment = useTimelineStore(state => state.selectSegment);
+    const selectClip = useTimelineStore(state => state.selectClip);
     const getAsset = useTimelineStore(state => state.getAsset);
     const getClipById = useTimelineStore(state => state.getClipById);
 
@@ -39,11 +40,17 @@ export function TimelineClip({
 
     const handleClick = (e: React.MouseEvent) => {
         e.stopPropagation();
+        console.warn('%c[TimelineClip] CLICK - selecting clip: ' + segment.clipId, 'background: red; color: white; font-size: 16px');
         selectSegment(segment.id);
+        // Also select the clip for transform overlay
+        selectClip(segment.clipId);
     };
 
     const handleMouseDown = (e: React.MouseEvent) => {
         if (e.button === 0) {
+            // Select clip immediately on mousedown for transform overlay
+            console.warn('%c[TimelineClip] MOUSEDOWN - selecting clip: ' + segment.clipId, 'background: blue; color: white; font-size: 16px');
+            selectClip(segment.clipId);
             onDragStart(e, segment, trackId);
         }
     };

@@ -5,7 +5,8 @@ import type {
     ClipData,
     Asset,
     TimelineState,
-    ClipSegment
+    ClipSegment,
+    ClipTransform
 } from '../types/timeline';
 import {
     generateId,
@@ -23,13 +24,17 @@ interface TimelineActions {
     addTrack: (type: 'video' | 'audio') => void;
     removeTrack: (trackId: string) => void;
     setTrackMuted: (trackId: string, muted: boolean) => void;
+    setTrackSolo: (trackId: string, solo: boolean) => void;
     setTrackLocked: (trackId: string, locked: boolean) => void;
+    setTrackVolume: (trackId: string, volume: number) => void;
 
     // Clip actions
     addClip: (trackId: string, clip: Omit<ClipData, 'id'>) => string;
     removeClip: (trackId: string, segmentId: string) => void;
     rippleDeleteClip: (trackId: string, segmentId: string) => void;
     moveClip: (fromTrackId: string, toTrackId: string, segmentId: string, newTimelineStart: number) => boolean;
+    setClipTransform: (clipId: string, transform: Partial<ClipTransform>) => void;
+    selectClip: (clipId: string | null) => void;
 
     // Asset actions
     addAsset: (asset: Asset) => void;
@@ -53,7 +58,7 @@ interface TimelineActions {
 
 type TimelineStore = TimelineState & TimelineActions;
 
-const DEFAULT_TRACK_HEIGHT = 60;
+const DEFAULT_TRACK_HEIGHT = 80;
 
 export const useTimelineStore = create<TimelineStore>()(
     subscribeWithSelector((set, get) => ({
@@ -65,14 +70,17 @@ export const useTimelineStore = create<TimelineStore>()(
                 name: 'V1',
                 segments: [], // Empty track with no segments
                 muted: false,
+                solo: false,
                 locked: false,
-                height: DEFAULT_TRACK_HEIGHT
+                height: DEFAULT_TRACK_HEIGHT,
+                volume: 1.0
             },
         ],
         assets: new Map(),
         clips: new Map(),
         selectedSegmentId: null,
         selectedTrackId: null,
+        selectedClipId: null as string | null, // For transform overlay
         duration: 0,
         zoom: 100, // 100 pixels per second
         scrollX: 0,
@@ -91,8 +99,10 @@ export const useTimelineStore = create<TimelineStore>()(
                     name: `${prefix}${typeCount + 1} `,
                     segments: [],
                     muted: false,
+                    solo: false,
                     locked: false,
                     height: DEFAULT_TRACK_HEIGHT,
+                    volume: 1.0
                 }]
             });
         },
@@ -111,10 +121,27 @@ export const useTimelineStore = create<TimelineStore>()(
             });
         },
 
+        setTrackSolo: (trackId, solo) => {
+            set({
+                tracks: get().tracks.map(t =>
+                    t.id === trackId ? { ...t, solo } : t
+                )
+            });
+        },
+
         setTrackLocked: (trackId, locked) => {
             set({
                 tracks: get().tracks.map(t =>
                     t.id === trackId ? { ...t, locked } : t
+                )
+            });
+        },
+
+        setTrackVolume: (trackId, volume) => {
+            const clampedVolume = Math.max(0, Math.min(1, volume));
+            set({
+                tracks: get().tracks.map(t =>
+                    t.id === trackId ? { ...t, volume: clampedVolume } : t
                 )
             });
         },
@@ -234,6 +261,25 @@ export const useTimelineStore = create<TimelineStore>()(
             get().updateDuration();
             console.log('[Timeline] Moved clip:', segmentId, 'to', newTimelineStart / 1_000_000, 's');
             return true;
+        },
+
+        setClipTransform: (clipId, transform) => {
+            const clips = new Map(get().clips);
+            const clip = clips.get(clipId);
+            if (clip) {
+                const currentTransform = clip.transform || { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+                clips.set(clipId, {
+                    ...clip,
+                    transform: { ...currentTransform, ...transform }
+                });
+                set({ clips });
+                console.log('[Timeline] Updated clip transform:', clipId, transform);
+            }
+        },
+
+        selectClip: (clipId) => {
+            console.log('[Timeline] selectClip called with:', clipId);
+            set({ selectedClipId: clipId });
         },
 
         // Asset actions

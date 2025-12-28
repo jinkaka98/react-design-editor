@@ -27,7 +27,9 @@ export function TimelineTrack({
     const selectTrack = useTimelineStore(state => state.selectTrack);
     const selectedTrackId = useTimelineStore(state => state.selectedTrackId);
     const setTrackMuted = useTimelineStore(state => state.setTrackMuted);
+    const setTrackSolo = useTimelineStore(state => state.setTrackSolo);
     const setTrackLocked = useTimelineStore(state => state.setTrackLocked);
+    const setTrackVolume = useTimelineStore(state => state.setTrackVolume);
 
     const isSelected = selectedTrackId === track.id;
 
@@ -39,11 +41,13 @@ export function TimelineTrack({
         >
             {/* Track header */}
             <div
-                className={`w-20 flex-shrink-0 flex flex-col justify-center items-center px-2 border-r border-gray-700
+                className={`w-24 flex-shrink-0 flex flex-col justify-center items-center px-2 border-r border-gray-700
                     ${isSelected ? 'bg-gray-700' : 'bg-gray-800'}`}
                 onClick={() => selectTrack(track.id)}
             >
                 <span className="text-xs font-bold text-white">{track.name}</span>
+
+                {/* Control buttons */}
                 <div className="flex gap-1 mt-1">
                     {/* Mute button */}
                     <button
@@ -56,6 +60,17 @@ export function TimelineTrack({
                     >
                         M
                     </button>
+                    {/* Solo button */}
+                    <button
+                        className={`w-5 h-5 text-[10px] font-bold rounded ${track.solo ? 'bg-yellow-500 text-black' : 'bg-gray-600 hover:bg-gray-500'}`}
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            setTrackSolo(track.id, !track.solo);
+                        }}
+                        title={track.solo ? 'Unsolo' : 'Solo'}
+                    >
+                        S
+                    </button>
                     {/* Lock button */}
                     <button
                         className={`w-5 h-5 text-[10px] font-bold rounded ${track.locked ? 'bg-yellow-600' : 'bg-gray-600 hover:bg-gray-500'}`}
@@ -67,6 +82,23 @@ export function TimelineTrack({
                     >
                         L
                     </button>
+                </div>
+
+                {/* Volume slider */}
+                <div className="w-full mt-1 px-1">
+                    <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={Math.round((track.volume ?? 1) * 100)}
+                        onChange={(e) => {
+                            e.stopPropagation();
+                            setTrackVolume(track.id, parseInt(e.target.value) / 100);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                        title={`Volume: ${Math.round((track.volume ?? 1) * 100)}%`}
+                    />
                 </div>
             </div>
 
