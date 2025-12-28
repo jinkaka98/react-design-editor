@@ -41,6 +41,7 @@ let audioEncoder: AudioEncoder | null = null;
 let muxer: Muxer<ArrayBufferTarget> | null = null;
 let frameCount = 0;
 let totalFrames = 0;
+let configFrameRate = 30; // Store frame rate for duration calculation
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
     const data = e.data;
@@ -59,6 +60,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
 async function initEncoders(config: InitMessage): Promise<void> {
     frameCount = 0;
     totalFrames = config.totalFrames;
+    configFrameRate = config.frameRate; // Store for frame duration calculation
 
     // Get appropriate codec level
     const codecLevel = getAvcLevel(config.width, config.height);
@@ -98,7 +100,10 @@ async function initEncoders(config: InitMessage): Promise<void> {
         width: config.width,
         height: config.height,
         bitrate: config.videoBitrate,
-        framerate: config.frameRate
+        framerate: config.frameRate,
+        latencyMode: 'quality',              // Prioritize quality over speed
+        hardwareAcceleration: 'prefer-hardware', // Use GPU encoder when available
+        bitrateMode: 'variable'              // VBR for better quality/size ratio
     });
 
     // Create audio encoder
@@ -127,9 +132,12 @@ async function encodeFrame(data: FrameMessage): Promise<void> {
     if (!videoEncoder) return;
 
     try {
+        // Calculate correct frame duration based on actual frame rate
+        const frameDurationUs = Math.round(1_000_000 / configFrameRate);
+
         const frame = new VideoFrame(data.bitmap, {
             timestamp: data.timestamp,
-            duration: 33333 // ~30fps in microseconds
+            duration: frameDurationUs // Dynamic duration based on frame rate
         });
 
         videoEncoder.encode(frame, { keyFrame: data.keyFrame });

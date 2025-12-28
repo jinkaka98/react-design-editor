@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { ExportPreset, EXPORT_PRESETS } from '../../types/video';
+import { ExportPreset, EXPORT_PRESETS, CATEGORY_LABELS, PresetCategory } from '../../types/video';
 import { exportManager, ExportProgress } from '../../core/ExportManager';
 import { useProjectStore } from '../../store/projectStore';
 
@@ -16,11 +16,12 @@ export function ExportDialog({ isOpen, onClose }: ExportDialogProps) {
         const matchProject: ExportPreset = {
             name: 'match-project',
             label: `Match Project (${projectSettings.width}×${projectSettings.height})`,
+            category: 'landscape' as PresetCategory,
             options: {
                 width: projectSettings.width,
                 height: projectSettings.height,
                 frameRate: 30,
-                videoBitrate: 10_000_000,
+                videoBitrate: 15_000_000, // Increased for better quality
                 audioBitrate: 192_000,
                 audioSampleRate: 48000
             }
@@ -111,9 +112,9 @@ export function ExportDialog({ isOpen, onClose }: ExportDialogProps) {
 
                 {/* Content */}
                 <div className="px-6 py-4 space-y-4">
-                    {/* Preset Selection */}
+                    {/* Preset Selection with Category Groups */}
                     <div>
-                        <label className="block text-sm text-gray-400 mb-2">Resolution Preset</label>
+                        <label className="block text-sm text-gray-400 mb-2">Export Preset</label>
                         <select
                             value={selectedPreset.name}
                             onChange={(e) => {
@@ -123,11 +124,28 @@ export function ExportDialog({ isOpen, onClose }: ExportDialogProps) {
                             disabled={isExporting}
                             className="w-full bg-gray-700 text-white rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                         >
-                            {allPresets.map(preset => (
-                                <option key={preset.name} value={preset.name}>
-                                    {preset.label}
-                                </option>
-                            ))}
+                            {/* Match Project - always first */}
+                            <option value="match-project">
+                                ⭐ {allPresets[0].label}
+                            </option>
+
+                            {/* Group by category */}
+                            {Object.entries(CATEGORY_LABELS).map(([category, label]) => {
+                                const categoryPresets = allPresets.filter(
+                                    p => p.category === category && p.name !== 'match-project'
+                                );
+                                if (categoryPresets.length === 0) return null;
+
+                                return (
+                                    <optgroup key={category} label={label}>
+                                        {categoryPresets.map(preset => (
+                                            <option key={preset.name} value={preset.name}>
+                                                {preset.label}
+                                            </option>
+                                        ))}
+                                    </optgroup>
+                                );
+                            })}
                         </select>
                     </div>
 

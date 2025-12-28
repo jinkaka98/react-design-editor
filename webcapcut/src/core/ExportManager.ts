@@ -207,20 +207,27 @@ export class ExportManager {
         durationSec: number,
         timelineState: ReturnType<typeof useTimelineStore.getState>
     ): Promise<void> {
-        // Create offscreen canvas
+        // Create offscreen canvas with high quality settings
         const offscreen = new OffscreenCanvas(options.width, options.height);
-        const ctx = offscreen.getContext('2d');
+        const ctx = offscreen.getContext('2d', {
+            alpha: false,               // No transparency needed, improves performance
+            desynchronized: true,        // Allow async rendering
+            willReadFrequently: false    // Optimize for drawing, not reading
+        });
 
         if (!ctx) {
             throw new Error('❌ Failed to create 2D context for export');
         }
+
+        // Enable high quality image smoothing
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
 
         console.log('[Export] Starting frame rendering...');
         console.log('[Export] Canvas:', options.width, 'x', options.height);
 
         let frameNum = 0;
         let lastLogTime = performance.now();
-        let lastVideoTime = -1; // Track last video time for sequential optimization
 
         const renderNextFrame = async () => {
             if (this.cancelled || !this.worker) {
@@ -260,37 +267,23 @@ export class ExportManager {
                 const video = videoClip.asset.videoElement;
                 const localTime = (timeUs - videoClip.segment.start + videoClip.clip.srcStart) / 1_000_000;
 
-                // Validate video state
-                if (video.readyState < 2) {
-                    console.warn(`[Export] ⚠️ Frame ${frameNum}: Video not ready (state=${video.readyState})`);
-                }
-
-                // Optimized seek strategy:
-                // - If forward seek <0.5s, use current frame (video decoder predicts well)
-                // - If backward seek or large jump, use random seek
+                // ALWAYS seek to exact time for accurate frame capture
                 const seekStart = performance.now();
-                const timeDiff = localTime - lastVideoTime;
+                const targetTime = Math.max(0, Math.min(localTime, video.duration - 0.01));
 
-                if (lastVideoTime >= 0 && timeDiff >= 0 && timeDiff < 0.5) {
-                    // Sequential forward - just wait for video to advance naturally
-                    // Video is already playing forward, minor sync adjustment
-                    if (Math.abs(video.currentTime - localTime) > 0.1) {
-                        video.currentTime = localTime;
-                        await this.waitForVideoSeekFast(video);
-                    }
-                    // else: use current frame as-is (fastest)
-                } else {
-                    // Random access needed (backwards or large jump)
-                    video.currentTime = Math.max(0, Math.min(localTime, video.duration));
-                    await this.waitForVideoSeek(video);
-                }
+                // Set video time and wait for seek to complete
+                video.currentTime = targetTime;
+                await this.waitForVideoSeekReliable(video, targetTime);
 
-                lastVideoTime = localTime;
                 seekTime = performance.now() - seekStart;
                 this.stats!.frameSeekTimes.push(seekTime);
 
-                // Draw with aspect ratio fit
-                this.drawVideoFit(ctx, video, options.width, options.height);
+                // Only draw if video frame is ready
+                if (video.readyState >= 2) {
+                    this.drawVideoFit(ctx, video, options.width, options.height);
+                } else {
+                    console.warn(`[Export] ⚠️ Frame ${frameNum}: Skipped - video not ready`);
+                }
             } else if (frameNum < 5) {
                 console.log(`[Export] Frame ${frameNum}: No video clip at time ${(timeUs / 1000000).toFixed(2)}s`);
             }
@@ -298,7 +291,10 @@ export class ExportManager {
             // Create bitmap and send to worker
             try {
                 const bitmapStart = performance.now();
-                const bitmap = await createImageBitmap(offscreen);
+                const bitmap = await createImageBitmap(offscreen, {
+                    resizeQuality: 'high',
+                    imageOrientation: 'none'
+                });
                 const bitmapTime = performance.now() - bitmapStart;
                 this.stats!.bitmapCreateTimes.push(bitmapTime);
 
@@ -508,36 +504,45 @@ export class ExportManager {
         ctx.drawImage(video, drawX, drawY, drawW, drawH);
     }
 
-    private waitForVideoSeek(video: HTMLVideoElement): Promise<void> {
+    /**
+     * Reliable video seek - waits for both 'seeked' and frame ready
+     * Longer timeout ensures frame is fully decoded before capture
+     */
+    private waitForVideoSeekReliable(video: HTMLVideoElement, _targetTime: number): Promise<void> {
         return new Promise((resolve) => {
-            if (video.readyState >= 2) {
+            let resolved = false;
+
+            const finish = () => {
+                if (resolved) return;
+                resolved = true;
+                video.removeEventListener('seeked', onSeeked);
+                video.removeEventListener('canplay', onCanPlay);
                 resolve();
+            };
+
+            const onSeeked = () => {
+                // After seek, check if frame is ready
+                if (video.readyState >= 3) { // HAVE_FUTURE_DATA
+                    finish();
+                }
+                // If not ready, wait for canplay
+            };
+
+            const onCanPlay = () => {
+                finish();
+            };
+
+            video.addEventListener('seeked', onSeeked);
+            video.addEventListener('canplay', onCanPlay);
+
+            // If already ready, resolve immediately
+            if (video.readyState >= 3) {
+                finish();
                 return;
             }
 
-            const onSeeked = () => {
-                video.removeEventListener('seeked', onSeeked);
-                resolve();
-            };
-            video.addEventListener('seeked', onSeeked);
-            setTimeout(resolve, 50);
-        });
-    }
-
-    // Fast version for sequential forward seeks - minimal wait
-    private waitForVideoSeekFast(video: HTMLVideoElement): Promise<void> {
-        return new Promise((resolve) => {
-            if (video.readyState >= 2) {
-                resolve();
-                return;
-            }
-
-            const onSeeked = () => {
-                video.removeEventListener('seeked', onSeeked);
-                resolve();
-            };
-            video.addEventListener('seeked', onSeeked);
-            setTimeout(resolve, 10); // Much shorter timeout for fast sequential seeks
+            // Longer timeout (500ms) to ensure proper decoding
+            setTimeout(finish, 500);
         });
     }
 
